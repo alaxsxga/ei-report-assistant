@@ -1,0 +1,22 @@
+# Environment Variables (Secrets)
+.env
+
+# Patient Data (PID - Private Information)
+raw files/
+structured files/
+
+# Vector Database (Contains PID embeddings)
+local_vector_db/
+chroma.sqlite3
+
+# Python Cache & Virtual Env
+__pycache__/
+*.pyc
+.venv/
+venv/
+bin/
+lib/
+include/
+
+# OS specific
+.DS_Store

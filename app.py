@@ -3,6 +3,7 @@ import chromadb
 import requests
 import json
 import os
+import re
 
 # ================= 設定區 =================
 # 資料庫設定
@@ -43,41 +44,53 @@ def generate_report(case_description):
     status_msg = "正在分析資料..."
     yield status_msg # 回傳給單一輸出欄位
     
-    # 查詢文字直接使用輸入內容
-    query_text = case_description
+    # --- 步驟 A: 解析與分割區塊 (Decomposed RAG) ---
+    # 匹配 "1. 精細動作" 或 "精細動作：" 等格式
+    section_pattern = r'(?:\n|^)(?:\d+[\.、]\s*)?([\u4e00-\u9fa5]{2,6})(?:[:：]|\s|\n)([\s\S]*?)(?=(?:\n\d+[\.、]\s*|[\u4e00-\u9fa5]{2,6}[:：]|$))'
+    sections = re.findall(section_pattern, case_description)
     
-    # --- 步驟 A: 檢索 (Retrieval) ---
-    embedding = get_embedding(query_text)
-    if not embedding:
-        err_msg = "錯誤：無法連接 Ollama，請確認 Ollama 已啟動。"
-        yield err_msg
-        return
+    if not sections:
+        query_tasks = [("綜合描述", case_description)]
+    else:
+        query_tasks = [(s[0].strip(), s[1].strip()) for s in sections if s[1].strip()]
 
     collection = get_chroma_collection()
-    # 為了確保能捕捉到「評估工具」與「生活自理」的高度相關資料，先取前 5 筆再來過濾
-    results = collection.query(
-        query_embeddings=[embedding],
-        n_results=5 
-    )
+    all_context_list = []
     
-    status_msg += "\n已檢索到參考案例，正在進行關聯度篩選..."
+    status_msg += f"\n檢測到 {len(query_tasks)} 個評估區塊，開始分區檢索..."
     yield status_msg
 
-    # 整理參考資料字串 (嚴格過濾：相似度 > 0.6)
-    filtered_docs = []
-    if results['distances'] and results['documents']:
-        for i, dist in enumerate(results['distances'][0]):
-            similarity = 1.0 - dist
-            if similarity > 0.6:
-                doc = results['documents'][0][i]
-                filtered_docs.append(f"【參考案例 {i+1} (關聯度: {similarity:.2f})】\n{doc}\n")
+    # --- 步驟 B: 針對每個區塊進行個別檢索 ---
+    for domain, content in query_tasks:
+        status_msg += f"\n🔍 檢索「{domain}」相關資料..."
+        yield status_msg
+        
+        # 將領域與內容合在一起做向量化，增加搜尋精準度
+        search_text = f"{domain}：{content}"
+        embedding = get_embedding(search_text)
+        
+        if not embedding:
+            continue
+
+        # 針對單一領域取相似度最高的前 3 筆，避免 Token 爆炸
+        results = collection.query(
+            query_embeddings=[embedding],
+            n_results=3 
+        )
+        
+        if results['distances'] and results['documents']:
+            for i, dist in enumerate(results['distances'][0]):
+                similarity = 1.0 - dist
+                if similarity > 0.6:
+                    doc = results['documents'][0][i]
+                    all_context_list.append(f"【針對「{domain}」的歷史參考資料 ({similarity:.2f})】\n{doc}\n")
     
-    if not filtered_docs:
-        context_str = "（⚠️ 警告：資料庫中未找到相似度 > 0.6 的高相關案例，以下報告將僅基於一般職能治療原則生成，可能不夠精準）"
-        status_msg += "\n⚠️ 未找到高相關案例 (>0.6)，僅依一般邏輯生成。"
+    if not all_context_list:
+        context_str = "（⚠️ 警告：所有區塊均未找到相似度 > 0.6 的案例，以下報告將僅基於一般邏輯生成）"
+        status_msg += "\n⚠️ 未找到高相關案例。"
     else:
-        context_str = "\n".join(filtered_docs)
-        status_msg += f"\n篩選完成，找到 {len(filtered_docs)} 筆高相關案例 (>0.6)。生成報告中..."
+        context_str = "\n".join(all_context_list)
+        status_msg += f"\n分區檢索完成，共收集 {len(all_context_list)} 筆高相關參考資料。生成報告中..."
     
     yield status_msg
         
@@ -108,10 +121,19 @@ def generate_report(case_description):
    - **禁止歸納與分析**：嚴禁寫成「...發展不足」或「...失調」等總結性結論。請直接將個案當下的具體行為表現填充進上述格式中。
 
 3. ### 總結與建議
-   - **標號規範**：主項目請務必使用數字標號（1. 2. 3. ...）；**若單一項目內容較長或包含多個面向，請在該點下方使用非數字的符號（如 ● 或 - ）進行次級列點**。
-   - **第一點 (1.)**：必須固定為療育課程建議，請僅使用「綜合以上結果，建議安排職能療育課程。」語句，**不可**添加任何額外說明。
-   - **後續建議 (從 2. 開始)**：後續點位必須與「問題分析」中的項目達成**一對一的標題對應**。例如：若問題分析列出三項問題，則建議部分應包含第 2、3、4 點，且每一點標題須與問題項目完全對齊。
-   - **實作深度**：請深入參考資料庫內容，提供具體的活動方向或訓練重點。在提到每項活動時，**必須包含簡易的說明**，交代執行該活動的「原因」或「目的」。敘述應詳盡且具體，避免使用空泛詞彙。
+   - **階層規範**：**所有主項目的數字標號（1. 2. 3. ...）必須位於同一層級，嚴禁將第 2、3 點縮排在第 1 點內。** 每一個數字標號都必須另起新行並靠左對齊。僅在單一項目內部的詳細子項才使用符號（如 ● 或 - ）進行縮排。
+   - **標號邏輯**：
+    *   **1.** 固定為療育課程建議句型，請嚴格模仿資料庫中的句型模式（例如：『綜合以上結果，建議安排職能療育課程』或『建議安排短期小團體職能療育課程』等），僅輸出該固定語句，不可添加額外說明。
+    *   **2. 之後**：直接延續數字標號，每一點對應一個問題領域。
+   - **實作深度與專業溫度**：活動說明應詳盡且具備臨床同理心，避免生硬的指令與過度感性的文學描述。
+      *   **敘述長度**：請詳盡描述活動的具體執行方式與家長可觀察的重點，內容應紮實且具備指導價值。
+      *   **臨床同理心**：語氣應專業且穩定，從孩子的生活功能出發，說明活動如何減少其在日常生活中的挫折感。
+      *   **目的明確**：必須清晰連結活動與改善目標的原因。
+      *   **範例風格**：『建議透過觸覺探索活動（如在沙中尋寶）來降低觸覺防禦。執行時請觀察孩子對不同質地的接受度，透過漸進式的參與來提升其環境適應力，進而減少其在學校團體生活中的排斥感與情緒波動。』
+      *   **範例結構**：
+          1. 綜合以上結果，建議安排職能療育課程。
+          2. 精細動作：......
+          3. 感覺統合：......
 """
 
     # 呼叫 Ollama 生成 (支援串流顯示)

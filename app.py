@@ -191,9 +191,15 @@ with gr.Blocks(title="AI 職能治療報告助手", theme=gr.themes.Soft()) as d
             
     # 綁定事件
     btn_submit.click(
+        fn=lambda: gr.update(interactive=False, value="⏳ 正在生成報告..."),
+        outputs=[btn_submit]
+    ).then(
         fn=generate_report,
         inputs=[input_case],
         outputs=[output_report]
+    ).then(
+        fn=lambda: gr.update(interactive=True, value="🧠 開始生成報告"),
+        outputs=[btn_submit]
     )
 
 if __name__ == "__main__":

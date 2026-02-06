@@ -21,7 +21,7 @@ COLLECTION_NAME = "ot_reports"
 # Ollama 設定 (用於 Embedding 和生成)
 OLLAMA_API_URL = "http://localhost:11434/api"
 EMBEDDING_MODEL = "nomic-embed-text"  # 必須與建立資料庫時一致
-GENERATION_MODEL = "qwen2.5:7b"      # 生成用的模型，可換成 llama3 或其他
+GENERATION_MODEL = "gemma2"          # Google 開源模型，邏輯性強、回覆乾淨
 # =========================================
 
 # 1. 資料庫連線函式
@@ -93,14 +93,31 @@ def generate_report(case_description):
                     doc = results['documents'][0][i]
                     all_context_list.append(f"【針對「{domain}」的歷史參考資料 ({similarity:.2f})】\n{doc}\n")
     
+    
     if not all_context_list:
         context_str = "（⚠️ 警告：所有區塊均未找到相似度 > 0.6 的案例，以下報告將僅基於一般邏輯生成）"
         status_msg += "\n⚠️ 未找到高相關案例。"
+        retrieval_info = "\n\n---\n## 📋 檢索結果\n\n未找到相似度 > 0.6 的參考案例。\n\n---\n"
     else:
         context_str = "\n".join(all_context_list)
-        status_msg += f"\n分區檢索完成，共收集 {len(all_context_list)} 筆高相關參考資料。生成報告中..."
+        status_msg += f"\n分區檢索完成，共收集 {len(all_context_list)} 筆高相關參考資料。"
+        
+        # 建立檢索結果摘要
+        retrieval_info = "\n\n---\n## 📋 檢索結果\n\n"
+        retrieval_info += f"**共檢索到 {len(all_context_list)} 筆參考資料：**\n\n"
+        
+        for idx, context in enumerate(all_context_list, 1):
+            # 提取領域和相似度
+            lines = context.split('\n')
+            header = lines[0] if lines else ""
+            preview = '\n'.join(lines[1:6]) if len(lines) > 1 else ""  # 顯示前5行
+            
+            retrieval_info += f"### {idx}. {header}\n\n"
+            retrieval_info += f"```\n{preview}\n...\n```\n\n"
+        
+        retrieval_info += "---\n\n## 🤖 開始生成報告...\n\n"
     
-    yield status_msg
+    yield status_msg + retrieval_info
         
     # --- 步驟 B: 生成 (Generation) ---
     # 使用 skill 模組中的 prompt

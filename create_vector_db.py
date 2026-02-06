@@ -48,7 +48,7 @@ class LocalRAGBuilder:
             raise
 
     def process_json_to_chunks(self, data: Dict) -> List[Dict]:
-        """將結構化 JSON 拆解為適合搜尋的文字塊"""
+        """將結構化 JSON 拆解為「因果連結」的完整語意塊"""
         chunks = []
         
         # 取得基本資訊
@@ -57,6 +57,27 @@ class LocalRAGBuilder:
         age = child_info.get("age_at_assessment", "Unknown")
         source_file = data.get("source_file", "unknown")
         
+        # 取得整體推理與建議 (這將作為每個塊的「答案」部分)
+        analysis = data.get("problem_analysis_structured", {})
+        reasoning = analysis.get("clinical_reasoning_text") or data.get("problem_analysis", "")
+        impact = analysis.get("impact_on_function", "")
+        issues = analysis.get("main_issues", [])
+        
+        recs = data.get("recommendations", {})
+        goals = recs.get("treatment_goals", [])
+        strategies = recs.get("home_school_strategies", [])
+        activities = recs.get("suggested_activities", [])
+
+        # 格式化建議與推理，作為共同的「邏輯結尾」
+        logic_suffix = (
+            f"\n--- 專業分析與建議核心 ---\n"
+            f"【臨床推理與問題分析】：\n{reasoning}\n"
+            f"【核心問題】：{', '.join(issues) if isinstance(issues, list) else issues}\n"
+            f"【治療目標與課程重心】：{', '.join(goals) if isinstance(goals, list) else goals}\n"
+            f"【具體建議與建議活動】：{', '.join(activities) if isinstance(activities, list) else activities}\n"
+            f"【居家與學校策略建議】：{', '.join(strategies) if isinstance(strategies, list) else strategies}"
+        )
+
         base_metadata = {
             "child_name": name,
             "child_age": age,
@@ -64,21 +85,7 @@ class LocalRAGBuilder:
             "processed_at": datetime.now().isoformat()
         }
 
-        # 1. 主訴與背景塊
-        concerns = data.get("family_concerns", [])
-        if isinstance(concerns, list):
-            concerns_text = "、".join(concerns)
-        else:
-            concerns_text = str(concerns)
-            
-        chunks.append({
-            "id": f"{source_file}_profile",
-            "text": f"個案姓名：{name}，年齡：{age}。家屬主訴與期待：{concerns_text}",
-            "metadata": {**base_metadata, "type": "profile"}
-        })
-
-        # 2. 評估領域塊 (重點！)
-        # 我們要把每個領域拆開，這樣搜尋 "精細動作" 才會準
+        # 1. 強化後的領域塊 (核心：評估+建議 捆綁)
         domains = data.get("assessment_domains", [])
         for idx, domain in enumerate(domains):
             domain_name = domain.get("domain", "未分類")
@@ -87,12 +94,13 @@ class LocalRAGBuilder:
             scores = domain.get("quantitative_data") or domain.get("scores", "")
             interp = domain.get("interpretation") or domain.get("findings", "")
             
-            # 組合出一段豐富的描述文字
+            # 組合出一段「有因有果」的描述文字
             content = (
-                f"個案：{name}。評估領域：{domain_name}。狀態：{status}。\n"
-                f"觀察與表現：{obs}\n"
-                f"數據與結果：{scores}\n"
-                f"綜合解釋：{interp}"
+                f"【領域現狀】個案：{name}。評估領域：{domain_name}。狀態：{status}。\n"
+                f"【觀察與表現】：{obs}\n"
+                f"【數據與結果】：{scores}\n"
+                f"【綜合解釋】：{interp}\n"
+                f"{logic_suffix}"  # 強行接入該全案的推理與建議
             )
             
             chunks.append({
@@ -106,46 +114,15 @@ class LocalRAGBuilder:
                 }
             })
 
-        # 3. 問題分析與推理塊
-        analysis = data.get("problem_analysis_structured", {})
-        if analysis:
-            reasoning = analysis.get("clinical_reasoning_text") or data.get("problem_analysis", "")
-            impact = analysis.get("impact_on_function", "")
-            issues = analysis.get("main_issues", [])
+        # 2. 綜合描述塊 (針對主訴搜尋)
+        concerns = data.get("family_concerns", [])
+        concerns_text = "、".join(concerns) if isinstance(concerns, list) else str(concerns)
             
-            content = (
-                f"個案：{name}。臨床問題分析與推理。\n"
-                f"核心問題：{', '.join(issues)}\n"
-                f"推理邏輯：{reasoning}\n"
-                f"對生活功能的影響：{impact}"
-            )
-            
-            chunks.append({
-                "id": f"{source_file}_analysis",
-                "text": content,
-                "metadata": {**base_metadata, "type": "analysis"}
-            })
-
-        # 4. 建議塊
-        recs = data.get("recommendations", {})
-        if recs:
-            goals = recs.get("treatment_goals", [])
-            strategies = recs.get("home_school_strategies", [])
-            activities = recs.get("suggested_activities", [])
-            
-            # 將列表轉字串
-            content = (
-                f"個案：{name}。治療建議與居家策略。\n"
-                f"治療目標：{str(goals)}\n"
-                f"居家/學校策略：{str(strategies)}\n"
-                f"建議活動：{str(activities)}"
-            )
-            
-            chunks.append({
-                "id": f"{source_file}_recommendation",
-                "text": content,
-                "metadata": {**base_metadata, "type": "recommendation"}
-            })
+        chunks.append({
+            "id": f"{source_file}_profile",
+            "text": f"【個案主訴】姓名：{name}，年齡：{age}。主訴期待：{concerns_text}\n{logic_suffix}",
+            "metadata": {**base_metadata, "type": "profile"}
+        })
             
         return chunks
 

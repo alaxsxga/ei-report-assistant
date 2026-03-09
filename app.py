@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import anthropic
+import base64
 from dotenv import load_dotenv
 
 # 載入 .env 檔案
@@ -203,10 +204,144 @@ def generate_report(case_description, model_choice):
             print(f"❌ {error_msg}")
             yield error_msg
 
+
 # ================= 介面設計 (Gradio) =================
-with gr.Blocks(title="AI 職能治療報告助手", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🏥 AI 職能治療報告助手 (Local RAG)")
-    gr.Markdown("輸入個案的主訴與觀察，將參考歷史病歷庫，生成問題分析與建議。")
+
+def get_base64_image(image_path):
+    with open(image_path, "rb") as img_file:
+        return base64.b64encode(img_file.read()).decode('utf-8')
+
+# 定義極簡毛玻璃風格 (Minimalist Glassmorphism - Spring Edition)
+custom_css = """
+    /* 背景與基礎重設 */
+    .gradio-container {
+        font-family: 'Inter', -apple-system, system-ui, sans-serif;
+        color: #2d3748;
+        background: linear-gradient(120deg, #f0fff4 0%, #fff5f0 100%) !important;
+        background-attachment: fixed !important;
+    }
+    
+    /* 建立 Mesh Gradient 視覺效果 */
+    .gradio-container::before {
+        content: "";
+        position: fixed;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background: 
+            radial-gradient(at 0% 0%, rgba(198, 246, 213, 0.6) 0, transparent 50%),
+            radial-gradient(at 50% 0%, rgba(255, 239, 213, 0.6) 0, transparent 50%),
+            radial-gradient(at 100% 0%, rgba(254, 215, 226, 0.5) 0, transparent 50%),
+            radial-gradient(at 0% 100%, rgba(154, 230, 180, 0.4) 0, transparent 50%),
+            radial-gradient(at 100% 100%, rgba(255, 226, 194, 0.5) 0, transparent 50%);
+        z-index: -1;
+    }
+
+    /* 移除 Gradio 預設的深灰色背景與邊框 */
+    #root, .main, .wrap, .cont, .form, .gr-form, .gr-padded, .padded {
+        background: transparent !important;
+        background-color: transparent !important;
+        border: none !important;
+    }
+
+    /* 強制所有區塊（卡片）保持一致的毛玻璃風格 */
+    .block, .gr-box, .gr-panel, .form, fieldset {
+        background: rgba(255, 255, 255, 0.6) !important;
+        backdrop-filter: blur(25px) saturate(160%) !important;
+        -webkit-backdrop-filter: blur(25px) saturate(160%) !important;
+        border: 1px solid rgba(255, 255, 255, 0.8) !important;
+        border-radius: 24px !important;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.04) !important;
+        padding: 30px !important;
+        margin-bottom: 25px !important;
+    }
+    
+    /* 針對 Radio 選項容器做特別處理，避免出現預設灰色 */
+    .gr-radio-group, .wrap.inline {
+        background: transparent !important;
+        border: none !important;
+    }
+    
+    /* 選項按鈕內部的容器 */
+    .gr-input-label {
+        background: rgba(255, 255, 255, 0.4) !important;
+        border: 1px solid rgba(255, 255, 255, 0.5) !important;
+        border-radius: 12px !important;
+        margin: 5px !important;
+        transition: all 0.2s ease;
+    }
+
+    /* 標題 - 溫柔通透感 */
+    h1 {
+        color: #4a5568 !important;
+        font-weight: 800 !important;
+        font-size: 2.5em !important;
+        text-shadow: 0 4px 10px rgba(0,0,0,0.05);
+        margin: 0.5em 0 !important;
+        text-align: center;
+    }
+    
+    /* 副標題說明文字 */
+    .gradio-container .prose p {
+        color: #718096 !important;
+        font-weight: 600;
+        font-size: 1.1em;
+        text-align: center;
+    }
+
+    /* 按鈕 - 粉橘漸層 */
+    button.primary {
+        background: linear-gradient(135deg, #f6ad55, #ed8936) !important;
+        color: #ffffff !important;
+        border: none !important;
+        font-weight: 700 !important;
+        font-size: 17px !important;
+        height: 54px !important;
+        border-radius: 16px !important;
+        box-shadow: 0 10px 20px rgba(237, 137, 54, 0.2) !important;
+        transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    button.primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 15px 30px rgba(237, 137, 54, 0.3) !important;
+        filter: brightness(1.05);
+    }
+
+    /* Radio 選中狀態 - 淺綠主題 */
+    .selected {
+        background: rgba(72, 187, 120, 0.15) !important;
+        color: #38a169 !important;
+        border-color: #48bb78 !important;
+    }
+
+    /* 標籤文字 */
+    span.label, label span, .meta-text {
+        color: #4a5568 !important;
+        font-weight: 700;
+        margin-bottom: 12px;
+        text-transform: uppercase;
+        font-size: 13px;
+        letter-spacing: 0.5px;
+    }
+
+    /* 文字輸入框樣式優化 */
+    textarea {
+        background: rgba(255, 255, 255, 0.3) !important;
+        border: 1px solid rgba(255, 255, 255, 0.5) !important;
+        border-radius: 16px !important;
+    }
+
+    /* 卷軸美化 */
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, 0.05);
+        border-radius: 10px;
+    }
+"""
+
+
+with gr.Blocks(title="AI 職能治療報告助手") as demo:
+    gr.Markdown("# 🏥 AI 職能治療報告助手 (Local RAG)\n輸入個案的主訴與觀察，將參考歷史病歷庫，生成問題分析與建議。")
     
     with gr.Row():
         with gr.Column(scale=1):
@@ -261,4 +396,4 @@ with gr.Blocks(title="AI 職能治療報告助手", theme=gr.themes.Soft()) as d
 
 if __name__ == "__main__":
     print("啟動網頁介面...")
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Base(), css=custom_css)

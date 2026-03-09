@@ -32,6 +32,11 @@ GENERATION_MODEL = "gemma2"          # Google 開源模型，邏輯性強、回�
 # Anthropic 設定
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+# Gemini 設定
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # =========================================
 
 # 1. 資料庫連線函式
@@ -63,6 +68,8 @@ def generate_report(case_description, model_choice):
     print(f"🤖 選擇模型: {model_choice}")
     if model_choice == "Claude 4 Sonnet (Cloud)":
         print(f"📝 使用 API 模型 ID: {CLAUDE_MODEL}")
+    elif model_choice == "Gemini 2.5 Flash (Cloud)":
+        print(f"📝 使用 API 模型 ID: {GEMINI_MODEL}")
     
     status_msg = "正在分析資料..."
     yield status_msg
@@ -164,8 +171,107 @@ def generate_report(case_description, model_choice):
                     yield full_response
                 print("✅ Claude 生成完畢")
         except Exception as e:
-            error_msg = f"Claude API 錯誤: {str(e)}"
-            print(f"❌ {error_msg}")
+            error_msg = f"❌ Claude API 錯誤: {str(e)}"
+            print(error_msg)
+            yield error_msg
+    elif model_choice == "Gemini 2.5 Flash (Cloud)":
+        print(f"☁️ 正在呼叫 Google Gemini API...")
+        if not GEMINI_API_KEY:
+            yield "❌ 錯誤：未偵測到 Gemini API Key，請檢查輸入或 .env 內容。"
+            return
+            
+        try:
+            # 加上 alt=sse 參數，強制回傳標準 Server-Sent Events (SSE) 單行 JSON 格式，避免切割換行錯誤
+            url = f"{GEMINI_API_URL}/{GEMINI_MODEL}:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}"
+            
+            # 使用正確的 v1beta 支援格式：system_instruction 必須放在最外層
+            payload = {
+                "system_instruction": {
+                    "parts": [{"text": system_prompt}]
+                },
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": user_prompt}]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 20000,
+                }
+            }
+            
+            print(f"📡 發送請求至: {url}")
+            response = requests.post(url, json=payload, stream=True)
+            
+            if response.status_code != 200:
+                try:
+                    error_data = response.json()
+                    print(f"DEBUG: API Error Raw Data: {error_data}")
+                    
+                    # 處理不同的錯誤格式 (dict 或 list)
+                    if isinstance(error_data, list):
+                        error_data = error_data[0]
+                    
+                    error_obj = error_data.get('error', {}) if isinstance(error_data, dict) else {}
+                    error_msg_detail = error_obj.get('message', str(error_data))
+                    error_msg = f"❌ Gemini API 伺服器回報錯誤 ({response.status_code})：{error_msg_detail}"
+                except Exception:
+                    error_msg = f"❌ Gemini API 伺服器回報錯誤 ({response.status_code})，且無法解析內容。原始回應：{response.text[:200]}"
+                
+                print(error_msg)
+                yield error_msg
+                return
+
+            full_response = ""
+            print("📝 Gemini 串流開始接收(SSE 模式)...")
+            for line in response.iter_lines():
+                if not line: continue
+                decoded_line = line.decode('utf-8').strip()
+                
+                # 處理標準 SSE 格式
+                if decoded_line.startswith("data: "):
+                    json_str = decoded_line[6:].strip() # 取出 "data: " 後面的內容
+                    if not json_str or json_str == "[DONE]": 
+                        continue
+                    
+                    try:
+                        body = json.loads(json_str)
+                        
+                        if "candidates" in body and body["candidates"]:
+                            candidate = body["candidates"][0]
+                            if "content" in candidate and "parts" in candidate["content"]:
+                                parts = candidate["content"].get("parts", [])
+                                if parts:
+                                    part = parts[0]
+                                    if isinstance(part, dict) and "text" in part:
+                                        token = part.get("text", "")
+                                        full_response += token
+                                        yield full_response
+                            
+                            # 加入安全診斷與錯誤原因印出
+                            finish_reason = candidate.get("finishReason")
+                            if finish_reason and finish_reason != "STOP":
+                                safety_msg = f"\n⚠️ [警告] Gemini 生成被迫中止。原因: {finish_reason}"
+                                print(safety_msg)
+                                if "safetyRatings" in candidate:
+                                    print(f"DEBUG: 觸發的安全過濾: {candidate.get('safetyRatings')}")
+                                yield full_response + safety_msg
+                        else:
+                            print(f"DEBUG: 發生預期外結構: {body}")
+
+                    except Exception as ex:
+                        print(f"⚠️ 解析 JSON 發生錯誤: {ex} 原始字串: {json_str[:50]}...")
+                        continue
+            
+            if not full_response:
+                yield "⚠️ Gemini 回傳內容為空。這通常是因為「醫療字眼」觸發了 Google 的安全防護 (Safety Filter) 被截斷，建議查閱終端機日誌。"
+            else:
+                print(f"✅ Gemini 生成完畢，共 {len(full_response)} 字")
+                
+        except Exception as e:
+            error_msg = f"❌ Gemini API 調用發生嚴重異常: {str(e)}"
+            print(error_msg)
             yield error_msg
     else:
         print(f"🏠 正在呼叫本地 Ollama ({GENERATION_MODEL})...")
@@ -200,8 +306,8 @@ def generate_report(case_description, model_choice):
                         continue
             print("✅ Ollama 生成完畢")
         except Exception as e:
-            error_msg = f"Ollama 生成時發生錯誤: {str(e)}"
-            print(f"❌ {error_msg}")
+            error_msg = f"❌ Ollama 生成時發生錯誤: {str(e)}"
+            print(error_msg)
             yield error_msg
 
 
@@ -351,21 +457,21 @@ with gr.Blocks(title="AI 職能治療報告助手") as demo:
                 lines=12
             )
             model_radio = gr.Radio(
-                choices=["Gemma2 (Local)", "Claude 4 Sonnet (Cloud)"],
-                value="Claude 4 Sonnet (Cloud)",
+                choices=["Gemma2 (Local)", "Gemini 2.5 Flash (Cloud)", "Claude 4 Sonnet (Cloud)"],
+                value="Gemini 2.5 Flash (Cloud)",
                 label="選擇生成模型"
             )
             api_key_input = gr.Textbox(
-                label="Anthropic API Key (若使用 Claude)",
-                placeholder="sk-...",
+                label="API Key (若使用 Gemini 或 Claude)",
+                placeholder="請輸入 API Key...",
                 type="password",
-                visible=False
+                visible=True
             )
             
             def toggle_api_input(choice):
-                if choice == "Claude 3.5 Sonnet (Cloud)":
-                    return gr.update(visible=True)
-                return gr.update(visible=False)
+                if choice == "Gemma2 (Local)":
+                    return gr.update(visible=False)
+                return gr.update(visible=True)
                 
             model_radio.change(fn=toggle_api_input, inputs=[model_radio], outputs=[api_key_input])
 
@@ -377,9 +483,12 @@ with gr.Blocks(title="AI 職能治療報告助手") as demo:
             
     # 綁定事件
     def process_with_key(case, model, key):
-        global ANTHROPIC_API_KEY
+        global ANTHROPIC_API_KEY, GEMINI_API_KEY
         if key:
-            ANTHROPIC_API_KEY = key
+            if "sk-" in key:
+                ANTHROPIC_API_KEY = key
+            else:
+                GEMINI_API_KEY = key
         yield from generate_report(case, model)
 
     btn_submit.click(

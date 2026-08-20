@@ -48,35 +48,15 @@ class LocalRAGBuilder:
             raise
 
     def process_json_to_chunks(self, data: Dict) -> List[Dict]:
-        """將結構化 JSON 拆解為「因果連結」的完整語意塊"""
+        """將結構化 JSON 拆解為語意塊：每個領域只帶「自己領域」的問題分析與建議，
+        不再把全案的建議混進每一個領域塊裡（避免跨領域污染）。"""
         chunks = []
-        
+
         # 取得基本資訊
         child_info = data.get("child_info", {})
         name = child_info.get("name_or_id", "Unknown")
         age = child_info.get("age_at_assessment", "Unknown")
         source_file = data.get("source_file", "unknown")
-        
-        # 取得整體推理與建議 (這將作為每個塊的「答案」部分)
-        analysis = data.get("problem_analysis_structured", {})
-        reasoning = analysis.get("clinical_reasoning_text") or data.get("problem_analysis", "")
-        impact = analysis.get("impact_on_function", "")
-        issues = analysis.get("main_issues", [])
-        
-        recs = data.get("recommendations", {})
-        goals = recs.get("treatment_goals", [])
-        strategies = recs.get("home_school_strategies", [])
-        activities = recs.get("suggested_activities", [])
-
-        # 格式化建議與推理，作為共同的「邏輯結尾」
-        logic_suffix = (
-            f"\n--- 專業分析與建議核心 ---\n"
-            f"【臨床推理與問題分析】：\n{reasoning}\n"
-            f"【核心問題】：{', '.join(issues) if isinstance(issues, list) else issues}\n"
-            f"【治療目標與課程重心】：{', '.join(goals) if isinstance(goals, list) else goals}\n"
-            f"【具體建議與建議活動】：{', '.join(activities) if isinstance(activities, list) else activities}\n"
-            f"【居家與學校策略建議】：{', '.join(strategies) if isinstance(strategies, list) else strategies}"
-        )
 
         base_metadata = {
             "child_name": name,
@@ -85,45 +65,72 @@ class LocalRAGBuilder:
             "processed_at": datetime.now().isoformat()
         }
 
-        # 1. 強化後的領域塊 (核心：評估+建議 捆綁)
+        # 1. 領域塊：觀察數據 + 只屬於這個領域的問題分析與建議
         domains = data.get("assessment_domains", [])
         for idx, domain in enumerate(domains):
             domain_name = domain.get("domain", "未分類")
             status = domain.get("status", "未知")
-            obs = domain.get("qualitative_observation") or domain.get("observations", "")
-            scores = domain.get("quantitative_data") or domain.get("scores", "")
-            interp = domain.get("interpretation") or domain.get("findings", "")
-            
-            # 組合出一段「有因有果」的描述文字
+            obs = domain.get("observations", "")
+            scores = domain.get("scores", "")
+            findings = domain.get("findings", "")
+
             content = (
                 f"【領域現狀】個案：{name}。評估領域：{domain_name}。狀態：{status}。\n"
                 f"【觀察與表現】：{obs}\n"
                 f"【數據與結果】：{scores}\n"
-                f"【綜合解釋】：{interp}\n"
-                f"{logic_suffix}"  # 強行接入該全案的推理與建議
+                f"【綜合解釋】：{findings}"
             )
-            
+
+            domain_issue = domain.get("domain_issue")
+            domain_reasoning = domain.get("domain_reasoning")
+            recs = domain.get("domain_recommendations") or {}
+            treatment_focus = recs.get("treatment_focus")
+            strategies = recs.get("home_school_strategies") or []
+            activities = recs.get("suggested_activities") or []
+
+            # 有沒有「真正的問題」才算 has_recommendation（給檢索優先權判斷用）。
+            # 純粹的通用鼓勵語句（例如「持續讓孩子參與生活自理」）不算，
+            # 否則正常案例的客套話會在檢索時把真正有問題案例的具體建議排擠掉。
+            has_recommendation = bool(domain_issue or domain_reasoning)
+            show_recommendation_block = bool(
+                domain_issue or domain_reasoning or treatment_focus or strategies or activities
+            )
+            if show_recommendation_block:
+                content += (
+                    f"\n\n--- 本領域專業分析與建議 ---\n"
+                    f"【問題點】：{domain_issue or ''}\n"
+                    f"【臨床推理】：{domain_reasoning or ''}\n"
+                    f"【治療重點】：{treatment_focus or ''}\n"
+                    f"【居家/學校策略】：{'、'.join(strategies)}\n"
+                    f"【建議活動】：{'、'.join(activities)}"
+                )
+
             chunks.append({
                 "id": f"{source_file}_domain_{idx}",
                 "text": content,
                 "metadata": {
-                    **base_metadata, 
+                    **base_metadata,
                     "type": "assessment_domain",
                     "domain": domain_name,
-                    "status": status
+                    "status": status,
+                    "has_recommendation": has_recommendation
                 }
             })
 
-        # 2. 綜合描述塊 (針對主訴搜尋)
+        # 2. 案例層級 profile 塊：主訴 + 是否安排課程的固定句型（不夾帶各領域建議）
         concerns = data.get("family_concerns", [])
         concerns_text = "、".join(concerns) if isinstance(concerns, list) else str(concerns)
-            
+        case_level_rec = data.get("case_level_recommendation") or ""
+
         chunks.append({
             "id": f"{source_file}_profile",
-            "text": f"【個案主訴】姓名：{name}，年齡：{age}。主訴期待：{concerns_text}\n{logic_suffix}",
+            "text": (
+                f"【個案主訴】姓名：{name}，年齡：{age}。主訴期待：{concerns_text}\n"
+                f"【課程安排結論】：{case_level_rec}"
+            ),
             "metadata": {**base_metadata, "type": "profile"}
         })
-            
+
         return chunks
 
     def add_to_db(self, chunks: List[Dict]):

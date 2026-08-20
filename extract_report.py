@@ -35,7 +35,7 @@ class OccupationalTherapyReportProcessor:
             raise ValueError("找不到 API Key！")
         
         self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-5"
         
     def extract_text_from_pdf(self, pdf_path: str) -> str:
         """從 PDF 萃取文字"""
@@ -63,23 +63,29 @@ class OccupationalTherapyReportProcessor:
 ### 1-3. 基本資訊與家屬主訴
 - **家屬主訴與期待**：請不要只摘要，請盡量保留「具體描述」。若有提到特定情境（如：學校坐不住、家裡不吃飯），請完整保留。
 
-### 4. 評估結果 (客觀數據與觀察)
-重點放在「評估工具的分數」以及「治療師看到的具體行為」。
+### 4-6. 評估結果、問題分析、建議 —— 必須「按領域」綁在一起，這是最重要的部分！
+
+報告裡的「問題分析」段落與「總結與建議」段落，內容通常是分領域寫的（例如：精細動作怎樣、感覺統合怎樣、認知發展怎樣）。**請不要把問題分析、建議整理成跟全案綁在一起的整體清單，而是要拆解、逐一對應回原本的評估領域**，直接寫進該領域的物件裡（見下方 JSON 格式的 `assessment_domains[i]`）。
+
 每個領域請提取：
-- domain: 領域 (精細/粗大/感覺/認知/生活自理)
+- domain: 領域 (精細/粗大/感覺/認知/生活自理...)
 - status: 發展狀態
 - assessment_tool: 工具名稱
 - quantitative_data: 量化數據 (分數、PR值、SD值)
 - qualitative_observation: 質性觀察 (具體的行為描述，如：無法單腳站立超過3秒)
-
-### 5. 問題分析 (核心推理) - 最重要！
-這是未來生成報告的關鍵。請將報告中的「問題分析」段落，拆解並整理成以下結構：
-- **clinical_reasoning (臨床推理)**: 這是治療師如何將「表現」連結到「根本原因」的過程。
+- domain_issue: **這個領域**在問題分析段落中對應的問題點簡述（若報告判定此領域無異常/無問題，填 null，不要硬掰）
+- domain_reasoning: **這個領域**的臨床推理，也就是治療師如何把「表現」連結到「根本原因」。
   例如：「寫字字跡潦草（表現）是源於手部肌力不足與本體覺回饋不佳（原因），導致書寫耐力下降（結果）。」
-  請嘗試總結報告中的推理邏輯。
+  若此領域無異常，填 null。
+- domain_recommendations: **只跟這個領域有關**的建議，物件格式：
+  - treatment_focus: 這個領域的治療課程重點（若無則 null）
+  - home_school_strategies: 給這個領域的居家/學校建議列表（若無則 []）
+  - suggested_activities: 給這個領域的具體訓練活動列表（若無則 []）
 
-### 6. 總結與建議
-- 請區分 **strategies_for_home (居家/學校建議)** 與 **therapy_focus (治療課程重點)**。
+**嚴禁把不同領域的建議或推理混在同一個領域底下**，也嚴禁把某個領域的建議複製貼到其他領域。如果報告原文對某個領域完全沒有寫問題分析或建議（例如判定為發展正常），對應欄位就填 null 或空陣列，不要為了填滿而發明內容。
+
+### 6b. 案例層級的固定句型（不屬於任何單一領域）
+報告的「總結與建議」通常會有一句開場的固定句型，決定是否安排職能治療課程（例如：「綜合以上結果，建議安排職能療育課程」）。這句話跟特定領域無關，請單獨萃取成 `case_level_recommendation`（見下方 JSON 格式），不要放進任何 `assessment_domains[i].domain_recommendations` 裡。
 
 ### 7. 關鍵詞
 萃取 8-15 個重要的專業術語，例如：
@@ -122,26 +128,24 @@ class OccupationalTherapyReportProcessor:
           "發展年齡": "數值"
         }}
       }},
-      "findings": "主要發現"
+      "findings": "主要發現",
+      "domain_issue": "這個領域對應的問題點簡述（無異常則 null）",
+      "domain_reasoning": "這個領域的臨床推理，表現→原因→結果（無異常則 null）",
+      "domain_recommendations": {{
+        "treatment_focus": "這個領域的治療課程重點（無則 null）",
+        "home_school_strategies": ["只跟這個領域有關的居家/學校建議"],
+        "suggested_activities": ["只跟這個領域有關的具體訓練活動"]
+      }}
     }}
   ],
-  "problem_analysis_structured": {{
-    "main_issues": ["核心問題1", "核心問題2"],
-    "clinical_reasoning_text": "完整的問題分析段落文字（保留原文的語氣與邏輯）",
-    "impact_on_function": "這些問題如何影響日常生活（如：影響課堂參與、甚至影響社交互動）"
-  }},
-  "recommendations": {{
-    "treatment_goals": ["治療目標1", "治療目標2"],
-    "home_school_strategies": ["給家長/老師的明確建議1", "建議2"],
-    "suggested_activities": ["具體訓練活動1", "活動2"]
-  }},
+  "case_level_recommendation": "總結與建議開場的固定句型，例如：綜合以上結果，建議安排職能療育課程（若報告沒有這句，填 null）",
   "keywords": ["關鍵詞1", "關鍵詞2"]
 }}
 
 請確保：
 1. 完整保留報告中的專業術語和數據
 2. 評估結果分領域清楚記錄
-3. 建議事項按領域分類
+3. 問題分析與建議事項都必須綁定回對應的 assessment_domains[i]，不要生成跟全案綁在一起、不分領域的清單
 4. 關鍵詞涵蓋職能治療的核心概念
 
 """
@@ -149,14 +153,16 @@ class OccupationalTherapyReportProcessor:
         try:
             message = self.client.messages.create(
                 model=self.model,
-                max_tokens=6000,  # 增加 token 數以處理較長的報告
+                max_tokens=16000,  # 新 schema 每個領域多了 domain_issue/reasoning/recommendations，輸出變長
                 messages=[{
                     "role": "user",
                     "content": prompt
                 }]
             )
             
-            response_text = message.content[0].text
+            response_text = next(
+                block.text for block in message.content if block.type == "text"
+            )
             
             # 移除 markdown 標記
             response_text = response_text.strip()

@@ -10,12 +10,20 @@ OT Report Generation Prompts Module
 from .standard_report import (
     get_system_prompt,
     get_user_prompt,
+    get_json_system_prompt,
+    get_json_user_prompt,
+    get_segmentation_system_prompt,
+    get_segmentation_user_prompt,
     get_prompt_metadata
 )
 
 __all__ = [
     'get_system_prompt',
     'get_user_prompt',
+    'get_json_system_prompt',
+    'get_json_user_prompt',
+    'get_segmentation_system_prompt',
+    'get_segmentation_user_prompt',
     'get_prompt_metadata'
 ]
 

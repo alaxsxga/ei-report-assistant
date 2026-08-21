@@ -18,7 +18,6 @@ sys.path.insert(0, SKILL_PATH)
 
 # 導入 prompt 模組
 from prompts import (
-    get_system_prompt, get_user_prompt,
     get_json_system_prompt, get_json_user_prompt,
     get_segmentation_system_prompt, get_segmentation_user_prompt
 )
@@ -33,13 +32,17 @@ OLLAMA_API_URL = "http://localhost:11434/api"
 EMBEDDING_MODEL = "nomic-embed-text"  # 必須與建立資料庫時一致
 GENERATION_MODEL = "gemma2"          # Google 開源模型，邏輯性強、回覆乾淨
 
+# Step A（拆解區塊）固定用本地模型，不管使用者選哪個生成模型——
+# 拆解區塊是範圍較窄的分類任務，本地小模型測試起來夠穩，且完全不受雲端 API 503／頻率限制影響
+SEGMENTATION_MODEL_CHOICE = "Gemma2 (Local)"
+
 # Anthropic 設定
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = "claude-sonnet-5"
 
 # Gemini 設定
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.7-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # =========================================
 
@@ -62,31 +65,6 @@ def match_canonical_domains(label, known_domains):
     result = exact + contains
     return result or None
 
-def parse_case_sections(case_description):
-    """逐行解析「領域：內容」格式的區塊，取代舊版一次性 regex（會漏掉相鄰區塊）。
-    支援同一個標籤底下有多行內容，直到遇到下一個「標籤：」開頭的行為止。"""
-    line_pattern = re.compile(r'^\s*(?:\d+[\.、]\s*)?([一-龥A-Za-z0-9]{2,12})[:：]\s*(.*)$')
-    sections = []
-    current_label = None
-    current_lines = []
-
-    def flush():
-        if current_label is not None:
-            text = '\n'.join(current_lines).strip()
-            if text:
-                sections.append((current_label, text))
-
-    for line in case_description.split('\n'):
-        m = line_pattern.match(line)
-        if m:
-            flush()
-            current_label = m.group(1).strip()
-            current_lines = [m.group(2)]
-        elif current_label is not None:
-            current_lines.append(line)
-    flush()
-    return sections
-
 def call_llm_text(model_choice, system_prompt, user_prompt):
     """非串流呼叫，回傳完整文字（結構化 JSON 生成用，串流沒辦法邊收邊 parse JSON）。
     不自動重試——遇到雲端 API 暫時性錯誤（503 伺服器忙碌、429 頻率限制）直接拋出清楚的錯誤訊息，
@@ -102,7 +80,7 @@ def call_llm_text(model_choice, system_prompt, user_prompt):
         raise
 
 def _call_llm_text_once(model_choice, system_prompt, user_prompt):
-    if model_choice == "Claude 4 Sonnet (Cloud)":
+    if model_choice == "Claude Sonnet 5 (Cloud)":
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         message = client.messages.create(
             model=CLAUDE_MODEL,
@@ -112,7 +90,7 @@ def _call_llm_text_once(model_choice, system_prompt, user_prompt):
         )
         return next(block.text for block in message.content if block.type == "text")
 
-    elif model_choice == "Gemini 2.5 Flash (Cloud)":
+    elif model_choice == "Gemini 3.7 Flash (Cloud)":
         url = f"{GEMINI_API_URL}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
@@ -166,31 +144,27 @@ def normalize_bullets(text):
     return f"{head}\n\n{body}" if head else body
 
 def segment_case_with_llm(case_description, model_choice, known_domains):
-    """用 LLM 語意判讀拆分區塊，取代不可靠的 regex 規則比對——
-    真實報告排版變化很多（有無冒號、括號編號 vs 數字編號、重複小標題），
-    regex 永遠會漏掉某種寫法，交給 LLM 對照已知領域清單來判讀比較穩。"""
-    try:
-        system_prompt = get_segmentation_system_prompt()
-        user_prompt = get_segmentation_user_prompt(case_description, known_domains)
-        raw = call_llm_text(model_choice, system_prompt, user_prompt)
-        data = parse_json_response(raw)
+    """用 LLM 語意判讀拆分區塊——真實報告排版變化很多（有無冒號、括號編號、
+    重複小標題），交給 LLM 對照已知領域清單來判讀。解析失敗就直接把錯誤往上拋，
+    不要靜默退回品質差很多的規則比對，讓使用者在不知情的情況下拿到打折的結果。"""
+    system_prompt = get_segmentation_system_prompt()
+    user_prompt = get_segmentation_user_prompt(case_description, known_domains)
+    raw = call_llm_text(model_choice, system_prompt, user_prompt)
+    data = parse_json_response(raw)
 
-        skipped = [d["domain"] for d in data if d.get("domain") and not d.get("has_issue", True)]
-        if skipped:
-            print(f"⏭️ 判定為無異常/不需要，不列入報告：{skipped}")
+    # 用 (d.get(key) or "") 而不是 d.get(key, "")——LLM 有時會把值明確設成 null 而不是省略欄位，
+    # 這種情況 .get(key, "") 拿到的還是 None，不是預設值，直接 .strip() 會噴錯
+    skipped = [d.get("domain") for d in data if d.get("domain") and not d.get("has_issue", True)]
+    if skipped:
+        print(f"⏭️ 判定為無異常/不需要，不列入報告：{skipped}")
 
-        sections = [
-            (d["domain"].strip(), d["content"].strip())
-            for d in data
-            if d.get("domain") and d.get("content", "").strip() and d.get("has_issue", True)
-        ]
-        if sections:
-            print(f"🧩 LLM 區塊解析成功：{[s[0] for s in sections]}")
-            return sections
-    except Exception as e:
-        print(f"⚠️ LLM 區塊解析失敗，改用規則解析: {e}")
-
-    return parse_case_sections(case_description)
+    sections = [
+        ((d.get("domain") or "").strip(), (d.get("content") or "").strip())
+        for d in data
+        if (d.get("domain") or "").strip() and (d.get("content") or "").strip() and d.get("has_issue", True)
+    ]
+    print(f"🧩 LLM 區塊解析完成：{[s[0] for s in sections]}" if sections else "🧩 LLM 判讀：沒有找到需要處理的問題領域")
+    return sections
 
 # 2. Embedding 函式 (將文字轉向量)
 def get_embedding(text):
@@ -209,186 +183,30 @@ def get_embedding(text):
         print(f"Ollama Connection Error: {e}")
         return None
 
-def generate_freeform_stream(model_choice, system_prompt, user_prompt):
-    """舊版：整段自由生成、邊生成邊串流。當輸入無法拆成領域區塊（沒有 domain_blocks）時的備用路徑，
-    無法保證每個領域都不會被漏寫，但至少能對非結構化輸入給出合理結果。"""
-    if model_choice == "Claude 4 Sonnet (Cloud)":
-        print(f"☁️ 正在呼叫 Anthropic Claude API...")
-        try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            with client.messages.stream(
-                model=CLAUDE_MODEL,
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_prompt}
-                ]
-            ) as stream:
-                print("📝 Claude 串流開始接收...")
-                full_response = ""
-                for text in stream.text_stream:
-                    full_response += text
-                    yield full_response
-                print("✅ Claude 生成完畢")
-        except Exception as e:
-            error_msg = f"❌ Claude API 錯誤: {str(e)}"
-            print(error_msg)
-            yield error_msg
-    elif model_choice == "Gemini 2.5 Flash (Cloud)":
-        print(f"☁️ 正在呼叫 Google Gemini API...")
-        if not GEMINI_API_KEY:
-            yield "❌ 錯誤：未偵測到 Gemini API Key，請檢查輸入或 .env 內容。"
-            return
-
-        try:
-            # 加上 alt=sse 參數，強制回傳標準 Server-Sent Events (SSE) 單行 JSON 格式，避免切割換行錯誤
-            url = f"{GEMINI_API_URL}/{GEMINI_MODEL}:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}"
-
-            # 使用正確的 v1beta 支援格式：system_instruction 必須放在最外層
-            payload = {
-                "system_instruction": {
-                    "parts": [{"text": system_prompt}]
-                },
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": user_prompt}]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "maxOutputTokens": 20000,
-                }
-            }
-
-            print(f"📡 發送請求至: {url}")
-            response = requests.post(url, json=payload, stream=True)
-
-            if response.status_code != 200:
-                try:
-                    error_data = response.json()
-                    print(f"DEBUG: API Error Raw Data: {error_data}")
-
-                    # 處理不同的錯誤格式 (dict 或 list)
-                    if isinstance(error_data, list):
-                        error_data = error_data[0]
-
-                    error_obj = error_data.get('error', {}) if isinstance(error_data, dict) else {}
-                    error_msg_detail = error_obj.get('message', str(error_data))
-                    error_msg = f"❌ Gemini API 伺服器回報錯誤 ({response.status_code})：{error_msg_detail}"
-                except Exception:
-                    error_msg = f"❌ Gemini API 伺服器回報錯誤 ({response.status_code})，且無法解析內容。原始回應：{response.text[:200]}"
-
-                print(error_msg)
-                yield error_msg
-                return
-
-            full_response = ""
-            print("📝 Gemini 串流開始接收(SSE 模式)...")
-            for line in response.iter_lines():
-                if not line: continue
-                decoded_line = line.decode('utf-8').strip()
-
-                # 處理標準 SSE 格式
-                if decoded_line.startswith("data: "):
-                    json_str = decoded_line[6:].strip() # 取出 "data: " 後面的內容
-                    if not json_str or json_str == "[DONE]":
-                        continue
-
-                    try:
-                        body = json.loads(json_str)
-
-                        if "candidates" in body and body["candidates"]:
-                            candidate = body["candidates"][0]
-                            if "content" in candidate and "parts" in candidate["content"]:
-                                parts = candidate["content"].get("parts", [])
-                                if parts:
-                                    part = parts[0]
-                                    if isinstance(part, dict) and "text" in part:
-                                        token = part.get("text", "")
-                                        full_response += token
-                                        yield full_response
-
-                            # 加入安全診斷與錯誤原因印出
-                            finish_reason = candidate.get("finishReason")
-                            if finish_reason and finish_reason != "STOP":
-                                safety_msg = f"\n⚠️ [警告] Gemini 生成被迫中止。原因: {finish_reason}"
-                                print(safety_msg)
-                                if "safetyRatings" in candidate:
-                                    print(f"DEBUG: 觸發的安全過濾: {candidate.get('safetyRatings')}")
-                                yield full_response + safety_msg
-                        else:
-                            print(f"DEBUG: 發生預期外結構: {body}")
-
-                    except Exception as ex:
-                        print(f"⚠️ 解析 JSON 發生錯誤: {ex} 原始字串: {json_str[:50]}...")
-                        continue
-
-            if not full_response:
-                yield "⚠️ Gemini 回傳內容為空。這通常是因為「醫療字眼」觸發了 Google 的安全防護 (Safety Filter) 被截斷，建議查閱終端機日誌。"
-            else:
-                print(f"✅ Gemini 生成完畢，共 {len(full_response)} 字")
-
-        except Exception as e:
-            error_msg = f"❌ Gemini API 調用發生嚴重異常: {str(e)}"
-            print(error_msg)
-            yield error_msg
-    else:
-        print(f"🏠 正在呼叫本地 Ollama ({GENERATION_MODEL})...")
-        # 呼叫 Ollama 生成 (支援串流顯示)
-        try:
-            response = requests.post(
-                f"{OLLAMA_API_URL}/chat",
-                json={
-                    "model": GENERATION_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "options": {"temperature": 0.2},
-                    "stream": True # 開啟串流
-                },
-                stream=True
-            )
-
-            full_response = ""
-            for line in response.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    try:
-                        body = json.loads(decoded_line)
-                        if "message" in body:
-                            token = body["message"]["content"]
-                            full_response += token
-                            yield full_response
-                        if body.get("done", False):
-                            break
-                    except json.JSONDecodeError:
-                        continue
-            print("✅ Ollama 生成完畢")
-        except Exception as e:
-            error_msg = f"❌ Ollama 生成時發生錯誤: {str(e)}"
-            print(error_msg)
-            yield error_msg
 
 # 3. 生成回應函式 (RAG 核心邏輯)
 def generate_report(case_description, model_choice):
     print(f"\n{'='*30}")
     print(f"🚀 開始生成報告任務")
     print(f"🤖 選擇模型: {model_choice}")
-    if model_choice == "Claude 4 Sonnet (Cloud)":
+    if model_choice == "Claude Sonnet 5 (Cloud)":
         print(f"📝 使用 API 模型 ID: {CLAUDE_MODEL}")
-    elif model_choice == "Gemini 2.5 Flash (Cloud)":
+    elif model_choice == "Gemini 3.7 Flash (Cloud)":
         print(f"📝 使用 API 模型 ID: {GEMINI_MODEL}")
     
     status_msg = "正在分析資料..."
     yield status_msg
     
-    # --- 步驟 A: 解析與分割區塊（用 LLM 語意判讀，比 regex 更能處理真實報告排版） ---
+    # --- 步驟 A: 解析與分割區塊（固定用本地模型，跟生成用的模型無關，見 SEGMENTATION_MODEL_CHOICE） ---
     collection = get_chroma_collection()
     known_domains = get_known_domains(collection)
 
-    sections = segment_case_with_llm(case_description, model_choice, known_domains)
+    try:
+        sections = segment_case_with_llm(case_description, SEGMENTATION_MODEL_CHOICE, known_domains)
+    except Exception as e:
+        print(f"❌ 區塊解析失敗: {e}")
+        yield status_msg + f"\n❌ 區塊解析失敗：{e}"
+        return
     print(f"📋 解析到內容區塊: {[s[0] for s in sections] if sections else '無(全域檢索)'}")
 
     if not sections:
@@ -396,124 +214,58 @@ def generate_report(case_description, model_choice):
     else:
         query_tasks = [(s[0].strip(), s[1].strip()) for s in sections if s[1].strip()]
 
-    all_candidates = []
-    problem_domain_context = {}  # 只收「有對應到真實領域」的區塊，給結構化生成用（保證每個都有份）
+    problem_domain_context = {}  # 每個真實領域各自的參考資料，是結構化生成唯一的資料來源
 
     status_msg += f"\n檢測到 {len(query_tasks)} 個評估區塊，開始分區檢索..."
     yield status_msg
 
-    # --- 步驟 B: 針對每個區塊進行個別檢索 ---
+    # --- 步驟 B: 只針對「對應得到資料庫真實領域」的區塊做檢索 ---
+    # 對不到領域的內容（例如「主訴」）不是評估領域，不參與檢索、也不會出現在最終報告裡
     for domain, content in query_tasks:
+        matched_domains = match_canonical_domains(domain, known_domains)
+        if not matched_domains:
+            print(f"⏭️ 「{domain}」不是資料庫裡的評估領域，略過檢索")
+            continue
+
         print(f"🔍 正在檢索領域: {domain}...")
         status_msg += f"\n🔍 檢索「{domain}」相關資料..."
         yield status_msg
 
         search_text = f"{domain}：{content}"
         embedding = get_embedding(search_text)
-
         if not embedding:
             print(f"❌ 「{domain}」Embedding 失敗")
+            problem_domain_context[domain] = ""
             continue
 
         # 優先用「領域」metadata 鎖定範圍，避免被其他領域但字面相似的內容打敗
-        matched_domains = match_canonical_domains(domain, known_domains)
-        if matched_domains:
-            domain_clause = (
-                {"domain": matched_domains[0]}
-                if len(matched_domains) == 1
-                else {"domain": {"$in": matched_domains}}
-            )
-            # 領域內優先找「有建議內容」的案例（狀態異常、有問題分析），
-            # 否則光靠 embedding 相似度容易撈到主題相近但狀態是「無異常」的案例，沒有建議可用
-            where_with_rec = {"$and": [domain_clause, {"has_recommendation": True}]}
-            results = collection.query(query_embeddings=[embedding], n_results=3, where=where_with_rec)
-            if not (results['distances'] and results['distances'][0]):
-                print(f"   ℹ️ 「{domain}」領域內沒有帶建議的案例，改抓一般觀察資料")
-                results = collection.query(query_embeddings=[embedding], n_results=3, where=domain_clause)
-            similarity_floor = 0.3  # 領域已鎖定，門檻可放寬
-            print(f"   🎯 鎖定領域：{matched_domains}")
+        domain_clause = (
+            {"domain": matched_domains[0]}
+            if len(matched_domains) == 1
+            else {"domain": {"$in": matched_domains}}
+        )
+        # 領域內優先找「有建議內容」的案例（狀態異常、有問題分析），
+        # 否則光靠 embedding 相似度容易撈到主題相近但狀態是「無異常」的案例，沒有建議可用
+        where_with_rec = {"$and": [domain_clause, {"has_recommendation": True}]}
+        results = collection.query(query_embeddings=[embedding], n_results=3, where=where_with_rec)
+        if not (results['distances'] and results['distances'][0]):
+            print(f"   ℹ️ 「{domain}」領域內沒有帶建議的案例，改抓一般觀察資料")
+            results = collection.query(query_embeddings=[embedding], n_results=3, where=domain_clause)
+        print(f"   🎯 鎖定領域：{matched_domains}")
 
-            # 這個領域自己的參考資料（不受下面全域去重/上限影響，保證每個真實領域都有份）
-            if results['distances'] and results['distances'][0]:
-                domain_docs = [
-                    results['documents'][0][i]
-                    for i in range(min(2, len(results['distances'][0])))
-                ]
-                problem_domain_context[domain] = "\n\n".join(domain_docs)
-            else:
-                problem_domain_context[domain] = ""
-        else:
-            results = collection.query(query_embeddings=[embedding], n_results=3)
-            similarity_floor = 0.6  # 沒對應到領域，維持全庫比對的高門檻
-            print(f"   🌐 無對應領域，改用全庫比對")
-
-        if results['distances'] and results['documents'] and results['distances'][0]:
-            found_count = 0
-            for i, dist in enumerate(results['distances'][0]):
+        domain_docs = []
+        if results['distances'] and results['distances'][0]:
+            for i, dist in enumerate(results['distances'][0][:2]):  # 最多保留前 2 筆最相似的
                 similarity = 1.0 - dist
-                if similarity > similarity_floor and found_count < 2:  # 每區塊最多保留前 2 筆最相似的
-                    found_count += 1
-                    doc = results['documents'][0][i]
-                    metadata = results['metadatas'][0][i] if results.get('metadatas') else {}
-                    source_file = metadata.get('source_file') or f"{domain}_{i}"
-                    all_candidates.append({
-                        "domain": domain,
-                        "similarity": similarity,
-                        "doc": doc,
-                        "source_file": source_file
-                    })
-            print(f"✅ 「{domain}」檢索完成，找到 {found_count} 筆相似資料")
+                if similarity > 0.3:  # 領域已鎖定，門檻可放寬，只用來濾掉完全不相關的
+                    domain_docs.append(results['documents'][0][i])
+        problem_domain_context[domain] = "\n\n".join(domain_docs)
+        print(f"✅ 「{domain}」檢索完成，找到 {len(domain_docs)} 筆相似資料")
 
-    # --- 跨區塊去重與總量上限，避免內容線性膨脹 ---
-    # 同一份歷史案例（source_file 相同）只保留相似度最高的一筆，其餘視為重複內容濾掉
-    best_by_source = {}
-    for c in all_candidates:
-        key = c["source_file"]
-        if key not in best_by_source or c["similarity"] > best_by_source[key]["similarity"]:
-            best_by_source[key] = c
-
-    MAX_CONTEXT_CHUNKS = 5  # 全部區塊合計最多取前 5 筆最相似的參考資料
-    deduped_candidates = sorted(best_by_source.values(), key=lambda c: c["similarity"], reverse=True)[:MAX_CONTEXT_CHUNKS]
-
-    all_context_list = [
-        f"【針對「{c['domain']}」的歷史參考資料 ({c['similarity']:.2f})】\n{c['doc']}\n"
-        for c in deduped_candidates
-    ]
-    if len(all_candidates) > len(all_context_list):
-        print(f"🧹 過濾：候選 {len(all_candidates)} 筆 → 去重/上限後保留 {len(all_context_list)} 筆")
-
-
-    if not all_context_list:
-        context_str = "（⚠️ 警告：所有區塊均未找到足夠相似的案例，以下報告將僅基於一般邏輯生成）"
-        status_msg += "\n⚠️ 未找到高相關案例。"
-        retrieval_info = "\n\n---\n## 📋 檢索結果\n\n未找到足夠相似的參考案例。\n\n---\n"
-    else:
-        context_str = "\n".join(all_context_list)
-        status_msg += f"\n分區檢索完成，共收集 {len(all_context_list)} 筆高相關參考資料。"
-        
-        # 建立檢索結果摘要
-        retrieval_info = "\n\n---\n## 📋 檢索結果\n\n"
-        retrieval_info += f"**共檢索到 {len(all_context_list)} 筆參考資料：**\n\n"
-        
-        for idx, context in enumerate(all_context_list, 1):
-            # 提取領域和相似度
-            lines = context.split('\n')
-            header = lines[0] if lines else ""
-            preview = '\n'.join(lines[1:6]) if len(lines) > 1 else ""  # 顯示前5行
-            
-            retrieval_info += f"### {idx}. {header}\n\n"
-            retrieval_info += f"```\n{preview}\n...\n```\n\n"
-        
-        retrieval_info += "---\n\n## 🤖 開始生成報告...\n\n"
-    
-    yield status_msg + retrieval_info
-        
-    yield status_msg + retrieval_info
-        
     # --- 步驟 C: 生成 (Generation) ---
     print(f"🧠 準備進入 LLM 生成階段...")
 
-    # 組出「真正對應到資料庫領域」的問題區塊清單（保證每個都有份，不受前面全域去重/上限影響）
+    # 組出「真正對應到資料庫領域」的問題區塊清單（保證每個都有份）
     domain_blocks = [
         {"domain": domain, "case_issue": content, "reference": problem_domain_context[domain]}
         for domain, content in query_tasks
@@ -521,6 +273,23 @@ def generate_report(case_description, model_choice):
     ]
 
     if domain_blocks:
+        # 顯示面板要跟實際生成用的資料一致：直接顯示 domain_blocks 裡每個領域自己的 reference，
+        # 不要再套用另一套「全域去重＋上限 5 筆」的邏輯（那套只在下面備援路徑才會被真的用到）
+        found_blocks = [b for b in domain_blocks if b["reference"]]
+        if not found_blocks:
+            retrieval_info = "\n\n---\n## 📋 檢索結果\n\n未找到足夠相似的參考案例，各領域將保守生成。\n\n---\n"
+        else:
+            retrieval_info = "\n\n---\n## 📋 檢索結果\n\n"
+            retrieval_info += f"**{len(found_blocks)}／{len(domain_blocks)} 個領域找到參考案例：**\n\n"
+            for b in domain_blocks:
+                retrieval_info += f"### 「{b['domain']}」\n\n"
+                if b["reference"]:
+                    preview = "\n".join(b["reference"].split("\n")[:5])
+                    retrieval_info += f"```\n{preview}\n...\n```\n\n"
+                else:
+                    retrieval_info += "（沒有找到足夠相似的參考案例，此領域內容將較保守）\n\n"
+            retrieval_info += "---\n\n## 🤖 開始生成報告...\n\n"
+
         # --- 結構化生成：LLM 只負責每個領域各自的內容，領域清單/編號/排版由程式碼保證完整 ---
         yield status_msg + retrieval_info + "\n🧠 正在針對各領域生成內容..."
 
@@ -555,19 +324,20 @@ def generate_report(case_description, model_choice):
             print(f"⚠️ 補呼叫後仍缺漏：{still_missing}")
 
         # --- 組裝最終報告，領域清單由程式碼掌控，保證不會漏 ---
+        # 一樣用 (d.get(key) or 預設值)，防止 LLM 把欄位明確設成 null 而不是省略或給空字串
         lines_out = ["### 問題分析"]
         for idx, b in enumerate(domain_blocks, 1):
             d = result_domains.get(b["domain"])
-            issue = d.get("issue_summary") if d else b["case_issue"]
+            issue = (d.get("issue_summary") if d else None) or b["case_issue"]
             lines_out.append(f"{idx}. {b['domain']}：{issue}")
 
         lines_out.append("")
         lines_out.append("### 總結與建議")
-        lines_out.append(f"1. {data.get('course_recommendation', '綜合以上結果，建議安排職能療育課程')}")
+        lines_out.append(f"1. {data.get('course_recommendation') or '綜合以上結果，建議安排職能療育課程'}")
         lines_out.append("")
         for idx, b in enumerate(domain_blocks, 2):
             d = result_domains.get(b["domain"])
-            rec = d.get("recommendation") if d else "（暫無足夠參考資料，建議由治療師進一步評估後補充）"
+            rec = (d.get("recommendation") if d else None) or "（暫無足夠參考資料，建議由治療師進一步評估後補充）"
             lines_out.append(f"{idx}. {b['domain']}")
             lines_out.append("")
             lines_out.append(normalize_bullets(rec))
@@ -577,11 +347,10 @@ def generate_report(case_description, model_choice):
         yield "\n".join(lines_out)
 
     else:
-        # --- 備用路徑：輸入無法拆成領域區塊（例如整段沒有「領域：」格式），退回舊版整段自由生成 ---
-        print("ℹ️ 沒有對應到領域的區塊，改用整段自由生成（無法保證領域完整性）")
-        system_prompt = get_system_prompt()
-        user_prompt = get_user_prompt(context_str, case_description)
-        yield from generate_freeform_stream(model_choice, system_prompt, user_prompt)
+        # 輸入裡沒有任何內容能對應到資料庫的真實評估領域，沒有素材可以結構化生成，直接清楚告知，
+        # 不再退回另一套「整段自由生成」的邏輯——只保留一條生成路徑。
+        print("⚠️ 沒有找到可處理的評估領域內容")
+        yield status_msg + "\n⚠️ 沒有找到可以處理的評估領域內容，請確認輸入內容是否包含實際的評估領域描述（例如：精細動作、感覺統合等）。"
 
 
 
@@ -731,8 +500,8 @@ with gr.Blocks(title="AI 職能治療報告助手") as demo:
                 lines=12
             )
             model_radio = gr.Radio(
-                choices=["Gemma2 (Local)", "Gemini 2.5 Flash (Cloud)", "Claude 4 Sonnet (Cloud)"],
-                value="Gemini 2.5 Flash (Cloud)",
+                choices=["Gemma2 (Local)", "Gemini 3.7 Flash (Cloud)", "Claude Sonnet 5 (Cloud)"],
+                value="Gemini 3.7 Flash (Cloud)",
                 label="選擇生成模型"
             )
             api_key_input = gr.Textbox(

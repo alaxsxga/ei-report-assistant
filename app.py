@@ -42,7 +42,7 @@ CLAUDE_MODEL = "claude-sonnet-5"
 
 # Gemini 設定
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-3.7-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # =========================================
 
@@ -90,7 +90,7 @@ def _call_llm_text_once(model_choice, system_prompt, user_prompt):
         )
         return next(block.text for block in message.content if block.type == "text")
 
-    elif model_choice == "Gemini 3.7 Flash (Cloud)":
+    elif model_choice == "Gemini 3.6 Flash (Cloud)":
         url = f"{GEMINI_API_URL}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
@@ -191,7 +191,7 @@ def generate_report(case_description, model_choice):
     print(f"🤖 選擇模型: {model_choice}")
     if model_choice == "Claude Sonnet 5 (Cloud)":
         print(f"📝 使用 API 模型 ID: {CLAUDE_MODEL}")
-    elif model_choice == "Gemini 3.7 Flash (Cloud)":
+    elif model_choice == "Gemini 3.6 Flash (Cloud)":
         print(f"📝 使用 API 模型 ID: {GEMINI_MODEL}")
     
     status_msg = "正在分析資料..."
@@ -500,46 +500,24 @@ with gr.Blocks(title="AI 職能治療報告助手") as demo:
                 lines=12
             )
             model_radio = gr.Radio(
-                choices=["Gemma2 (Local)", "Gemini 3.7 Flash (Cloud)", "Claude Sonnet 5 (Cloud)"],
-                value="Gemini 3.7 Flash (Cloud)",
+                choices=["Gemma2 (Local)", "Gemini 3.6 Flash (Cloud)", "Claude Sonnet 5 (Cloud)"],
+                value="Gemini 3.6 Flash (Cloud)",
                 label="選擇生成模型"
             )
-            api_key_input = gr.Textbox(
-                label="API Key (若使用 Gemini 或 Claude)",
-                placeholder="請輸入 API Key...",
-                type="password",
-                visible=True
-            )
-            
-            def toggle_api_input(choice):
-                if choice == "Gemma2 (Local)":
-                    return gr.update(visible=False)
-                return gr.update(visible=True)
-                
-            model_radio.change(fn=toggle_api_input, inputs=[model_radio], outputs=[api_key_input])
 
             btn_submit = gr.Button("🧠 開始生成報告", variant="primary")
-            
+
         with gr.Column(scale=1):
             # 使用 Markdown 元件顯示，視覺效果最佳
             output_report = gr.Markdown(label="生成的報告內容")
-            
-    # 綁定事件
-    def process_with_key(case, model, key):
-        global ANTHROPIC_API_KEY, GEMINI_API_KEY
-        if key:
-            if "sk-" in key:
-                ANTHROPIC_API_KEY = key
-            else:
-                GEMINI_API_KEY = key
-        yield from generate_report(case, model)
 
+    # 綁定事件（API Key 一律從 .env 讀取，不再提供網頁輸入框）
     btn_submit.click(
         fn=lambda: gr.update(interactive=False, value="⏳ 正在生成報告..."),
         outputs=[btn_submit]
     ).then(
-        fn=process_with_key,
-        inputs=[input_case, model_radio, api_key_input],
+        fn=generate_report,
+        inputs=[input_case, model_radio],
         outputs=[output_report]
     ).then(
         fn=lambda: gr.update(interactive=True, value="🧠 開始生成報告"),
